@@ -4,7 +4,7 @@ import sqlite3
 from contextlib import asynccontextmanager
 from typing import Iterator, Optional
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
 from . import service
@@ -13,6 +13,9 @@ from .models import (
     CitationResponse,
     ImportRequest,
     ImportResult,
+    ReportBaseline,
+    ReportBaselineIn,
+    ReportReview,
     RevisionIn,
     RevisionResult,
     WorkDetail,
@@ -43,7 +46,14 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             "the submitted version is still current (concurrent corrections on the "
             "same version: only the first to commit wins; the loser gets 409 and "
             "changes nothing). Citation lookups read the materialised index and "
-            "report the version they were read at."
+            "report the version they were read at.\n\n"
+            "For cited-by reports, a librarian registers a baseline (report number "
+            "+ representative DOI) and later reviews it: the review recounts the "
+            "output's incoming raw citations in the current version -- once "
+            "limited to the citations that existed at registration, once over all "
+            "of them -- and splits the drift since registration into a regrouping "
+            "part and a backfill part, listing the citing outputs added and "
+            "removed in each."
         ),
         version="1.0.0",
         lifespan=lifespan,
@@ -51,7 +61,23 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     @app.exception_handler(service.NotFound)
     async def _not_found(_: Request, exc: service.NotFound):
-        return JSONResponse(status_code=404, content={"detail": "work not found"})
+        return JSONResponse(
+            status_code=404, content={"detail": str(exc) or "not found"}
+        )
+
+    @app.exception_handler(service.BaselineConflict)
+    async def _baseline_conflict(_: Request, exc: service.BaselineConflict):
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": (
+                    f"report {exc.report_no!r} already has a baseline registered "
+                    f"with representative DOI {exc.existing_doi!r}; resubmit with "
+                    "that DOI or choose a new report number"
+                ),
+                "representative_doi": exc.existing_doi,
+            },
+        )
 
     @app.exception_handler(service.StaleVersion)
     async def _stale(_: Request, exc: service.StaleVersion):
@@ -166,6 +192,61 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     )
     def work(work_id: int, conn: sqlite3.Connection = Depends(get_conn)):
         return service.work_detail(conn, work_id)
+
+    @app.post(
+        "/report-baselines",
+        response_model=ReportBaseline,
+        status_code=201,
+        tags=["baselines"],
+        summary="Register the citation baseline of a report",
+    )
+    def register_baseline(
+        payload: ReportBaselineIn,
+        response: Response,
+        conn: sqlite3.Connection = Depends(get_conn),
+    ):
+        """Pin a report number to the cited-by baseline of one output.
+
+        ``doi`` is a representative DOI of the output and must already be
+        imported. The baseline records, from one consistent snapshot: the
+        dataset version, the deduplicated set of citing works (internal
+        citations excluded) and the boundary of the raw citation range that
+        exists now. Raw citations are not copied.
+
+        * Resubmitting the same report number with the same DOI returns the
+          stored baseline unchanged (``200``, ``created=false``).
+        * The same report number with a different DOI is a ``409`` conflict.
+        * A failed registration writes nothing, so the report number stays
+          free for a corrected resubmission.
+        """
+        result = service.register_baseline(conn, payload)
+        if not result.created:
+            response.status_code = 200
+        return result
+
+    @app.get(
+        "/report-baselines/{report_no}/review",
+        response_model=ReportReview,
+        tags=["baselines"],
+        summary="Recount a registered baseline against the current dataset",
+    )
+    def review_baseline(report_no: str, conn: sqlite3.Connection = Depends(get_conn)):
+        """Split the drift since registration into regrouping and backfill.
+
+        The representative DOI's work is resolved in the current version and
+        its incoming raw citations are recounted twice from one read snapshot
+        (imports and corrections keep running meanwhile): once limited to the
+        citations that existed at registration, once over all citations. Both
+        passes deduplicate per citing work and exclude internal citations.
+
+        * ``regrouping`` -- baseline vs. registration-range recount: same
+          citations, different grouping. Lists the citing works added and
+          removed even when the totals are equal.
+        * ``backfill`` -- registration-range recount vs. full recount: same
+          grouping, more citations.
+        """
+        with read_transaction(conn):
+            return service.review_baseline(conn, report_no)
 
     return app
 

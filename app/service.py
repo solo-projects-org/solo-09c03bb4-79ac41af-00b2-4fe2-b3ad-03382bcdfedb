@@ -21,10 +21,21 @@ mutation (import or correction) bumps it and commits together with its writes.
 A correction carries the version the librarian was looking at; if a concurrent
 correction (or import) committed first, the stale submission is rejected with
 HTTP 409 and leaves both the grouping and the index untouched.
+
+Report baselines
+----------------
+``report_baselines`` pins one report number to a representative DOI: the
+dataset version, the deduplicated citing-work set and the raw-citation range
+boundary at registration, all read from one serialised transaction.  Raw
+citations are never copied.  A review resolves the DOI's work in the *current*
+version and recounts from the raw citations twice -- once limited to the
+registration-time range, once over everything -- so the drift since
+registration splits into a regrouping part and a backfill part.
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
 from typing import Iterable
@@ -33,8 +44,13 @@ from .db import get_version, set_version, write_transaction
 from .models import (
     CitationEdge,
     CitationResponse,
+    CitingWorkDiff,
     ImportRequest,
     ImportResult,
+    ReportBaseline,
+    ReportBaselineIn,
+    ReportReview,
+    ReviewCounts,
     RevisionIn,
     RevisionResult,
     WorkDetail,
@@ -46,7 +62,7 @@ CHUNK = 500
 
 
 class NotFound(Exception):
-    """Requested work does not exist."""
+    """Requested work or report baseline does not exist."""
 
 
 class StaleVersion(Exception):
@@ -59,6 +75,18 @@ class StaleVersion(Exception):
 
 class InvalidRequest(Exception):
     """The request cannot be applied as submitted."""
+
+
+class BaselineConflict(Exception):
+    """The report number is already registered with a different DOI."""
+
+    def __init__(self, report_no: str, existing_doi: str):
+        super().__init__(
+            f"report {report_no!r} is already registered with "
+            f"representative DOI {existing_doi!r}"
+        )
+        self.report_no = report_no
+        self.existing_doi = existing_doi
 
 
 @dataclass(frozen=True)
@@ -400,7 +428,7 @@ def lookup(conn: sqlite3.Connection, work_id: int, direction: str) -> CitationRe
     """
     dois = _work_dois(conn, work_id)
     if not dois:
-        raise NotFound(str(work_id))
+        raise NotFound(f"work {work_id} not found")
 
     if direction == "references":
         column, other, label = "citing_work", "cited_work", "references"
@@ -437,9 +465,175 @@ def lookup(conn: sqlite3.Connection, work_id: int, direction: str) -> CitationRe
 def work_detail(conn: sqlite3.Connection, work_id: int) -> WorkDetail:
     dois = _work_dois(conn, work_id)
     if not dois:
-        raise NotFound(str(work_id))
+        raise NotFound(f"work {work_id} not found")
     return WorkDetail(id=work_id, dois=dois)
 
 
 def current_version(conn: sqlite3.Connection) -> int:
     return get_version(conn) or 0
+
+
+# ---------------------------------------------------------------------------
+# Citation-report baselines (register + review)
+# ---------------------------------------------------------------------------
+
+
+def _citing_work_ids(
+    conn: sqlite3.Connection, work_key: str, max_citation_id: int | None
+) -> list[int]:
+    """Distinct works with a raw citation into ``work_key``, internal excluded.
+
+    Reads the raw citation table (not the index): a review recomputes from the
+    immutable DOI-level records under the grouping of the current snapshot.
+    ``max_citation_id`` restricts to the raw-citation range that existed at
+    registration; ``None`` counts everything.
+    """
+    sql = (
+        "SELECT DISTINCT citer.work_key AS citing_work "
+        "FROM citations c "
+        "JOIN work_dois citer ON citer.doi = c.citing_doi "
+        "WHERE c.cited_doi IN (SELECT doi FROM work_dois WHERE work_key = ?) "
+        "AND citer.work_key <> ?"
+    )
+    params: list = [work_key, work_key]
+    if max_citation_id is not None:
+        sql += " AND c.id <= ?"
+        params.append(max_citation_id)
+    return sorted(int(row["citing_work"]) for row in conn.execute(sql, params))
+
+
+def register_baseline(
+    conn: sqlite3.Connection, payload: ReportBaselineIn
+) -> ReportBaseline:
+    """Register (or reuse) the citation baseline for one report number.
+
+    The dataset version, the citing-work set and the raw-citation range are
+    read inside one serialised write transaction, so all three describe the
+    same version.  Raw citations are not copied: only the id boundary of the
+    range existing at registration is stored.  Any failure rolls the
+    transaction back, so a failed registration leaves no baseline behind.
+    Resubmitting the same report number with the same DOI returns the stored
+    baseline unchanged; a different DOI for the same report number conflicts.
+    """
+    report_no = payload.report_no.strip()
+    doi = _norm(payload.doi)
+    if not report_no:
+        raise InvalidRequest("report number must not be blank")
+    if "/" in report_no:
+        raise InvalidRequest("report number must not contain '/'")
+    if not doi:
+        raise InvalidRequest("DOI must not be blank")
+
+    with write_transaction(conn):
+        row = conn.execute(
+            "SELECT * FROM report_baselines WHERE report_no = ?", (report_no,)
+        ).fetchone()
+        if row is not None:
+            if row["representative_doi"] != doi:
+                raise BaselineConflict(report_no, row["representative_doi"])
+            return _baseline_from_row(row, created=False)
+
+        work_row = conn.execute(
+            "SELECT work_key FROM work_dois WHERE doi = ?", (doi,)
+        ).fetchone()
+        if work_row is None:
+            raise InvalidRequest(
+                f"representative DOI {doi!r} has no imported provenance; "
+                "import it before registering a baseline"
+            )
+        work_key = work_row["work_key"]
+
+        version = get_version(conn) or 0
+        max_citation_id = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS m FROM citations"
+        ).fetchone()["m"]
+        citing = _citing_work_ids(conn, work_key, max_citation_id)
+
+        conn.execute(
+            "INSERT INTO report_baselines("
+            "report_no, representative_doi, work_key, baseline_version, "
+            "max_citation_id, citing_works) VALUES (?, ?, ?, ?, ?, ?)",
+            (report_no, doi, work_key, version, max_citation_id, json.dumps(citing)),
+        )
+
+    return ReportBaseline(
+        report_no=report_no,
+        representative_doi=doi,
+        work_id=int(work_key),
+        baseline_version=version,
+        max_citation_id=max_citation_id,
+        citing_works=citing,
+        citation_count=len(citing),
+        created=True,
+    )
+
+
+def _baseline_from_row(row: sqlite3.Row, created: bool) -> ReportBaseline:
+    citing = [int(work) for work in json.loads(row["citing_works"])]
+    return ReportBaseline(
+        report_no=row["report_no"],
+        representative_doi=row["representative_doi"],
+        work_id=int(row["work_key"]),
+        baseline_version=row["baseline_version"],
+        max_citation_id=row["max_citation_id"],
+        citing_works=citing,
+        citation_count=len(citing),
+        created=created,
+    )
+
+
+def review_baseline(conn: sqlite3.Connection, report_no: str) -> ReportReview:
+    """Recount a registered baseline against the current dataset.
+
+    The caller holds one read transaction, so the current version, the
+    representative DOI's current work and the raw citations all come from the
+    same snapshot while imports and corrections keep running.  Three
+    statistics are produced, each deduplicated per citing work with internal
+    citations excluded:
+
+    * the stored baseline (registration-time grouping and citation range);
+    * a recount of the registration-time citation range under the *current*
+      grouping -- its difference to the baseline is attributed to regrouping;
+    * a recount of all citations under the current grouping -- its difference
+      to the previous pass is attributed to backfilled citations.
+    """
+    report_no = report_no.strip()
+    row = conn.execute(
+        "SELECT * FROM report_baselines WHERE report_no = ?", (report_no,)
+    ).fetchone()
+    if row is None:
+        raise NotFound(f"no baseline registered for report {report_no!r}")
+
+    doi = row["representative_doi"]
+    work_row = conn.execute(
+        "SELECT work_key FROM work_dois WHERE doi = ?", (doi,)
+    ).fetchone()
+    if work_row is None:  # DOI rows are never deleted; guard anyway.
+        raise RuntimeError(f"representative DOI {doi!r} lost its work assignment")
+    work_key = work_row["work_key"]
+
+    baseline = set(json.loads(row["citing_works"]))
+    registration = set(_citing_work_ids(conn, work_key, row["max_citation_id"]))
+    full = set(_citing_work_ids(conn, work_key, None))
+
+    return ReportReview(
+        report_no=row["report_no"],
+        representative_doi=doi,
+        work_id=int(work_key),
+        work_dois=_work_dois(conn, int(work_key)),
+        baseline_version=row["baseline_version"],
+        current_version=get_version(conn) or 0,
+        counts=ReviewCounts(
+            baseline=len(baseline),
+            registration_recount=len(registration),
+            full_recount=len(full),
+        ),
+        regrouping=CitingWorkDiff(
+            added=sorted(registration - baseline),
+            removed=sorted(baseline - registration),
+        ),
+        backfill=CitingWorkDiff(
+            added=sorted(full - registration),
+            removed=sorted(registration - full),
+        ),
+    )

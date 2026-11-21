@@ -28,6 +28,8 @@ docker compose up --build
 | `GET` | `/works/{id}/references` | Works cited by this work (outgoing) |
 | `GET` | `/works/{id}/cited-by` | Works citing this work (incoming) |
 | `GET` | `/works/{id}` | Work and its DOIs |
+| `POST` | `/report-baselines` | Register a report's cited-by baseline (idempotent per report no.) |
+| `GET` | `/report-baselines/{no}/review` | Recount the baseline now; split drift into regrouping vs. backfill |
 | `GET` | `/health` | Liveness + current version |
 
 ### Import
@@ -74,6 +76,41 @@ each response reports the version it was read at together with the work's DOIs.
 Each edge is deduplicated per work and carries `doi_count` — the number of
 distinct DOI-level citation records behind it.
 
+### Report baselines and review
+
+When a cited-by report's numbers change, the library needs to know whether the
+grouping was corrected (DOIs moved between outputs) or citations were
+backfilled. A librarian pins a report number to a representative DOI of the
+output:
+
+```json
+{"report_no": "RPT-2026-11", "doi": "10.1000/journal.2024.1"}
+```
+
+Registration records, from one consistent snapshot: the dataset version, the
+deduplicated set of citing works (internal citations excluded) and the
+boundary of the raw citation range that exists at that moment. Raw citations
+are **not** copied — the range boundary refers to the shared, immutable
+`citations` table. A failed registration writes nothing; resubmitting the
+same report number with the same DOI returns the stored baseline (`200`,
+`created=false`), and the same number with a different DOI is a `409`
+conflict. Baselines persist in the database, so a review works after restarts.
+
+`GET /report-baselines/{no}/review` resolves the representative DOI's output
+in the **current** version and recounts its incoming raw citations twice from
+one read snapshot (imports and corrections keep running meanwhile): once
+limited to the citations that existed at registration, once over all of them.
+Both passes deduplicate per citing work and exclude internal citations. The
+response carries the baseline version, the current version and three counts:
+
+* `baseline` vs. `registration_recount` — same citations, different grouping:
+  the difference is attributed to **regrouping**;
+* `registration_recount` vs. `full_recount` — same grouping, more citations:
+  the difference is attributed to **backfill**.
+
+Each part lists the citing work ids added and removed, so churn is visible
+even when the totals cancel out.
+
 ## Tests
 
 ```bash
@@ -87,5 +124,5 @@ python -m pytest -q
   the writes are one serialised unit. Reads use one snapshot transaction.
 * Raw `citations` are immutable; corrections only move DOIs between works and
   update `citation_index`.
-* Tables: `meta`, `works`, `work_dois`, `citations`, `citation_index`
-  (see `app/db.py`).
+* Tables: `meta`, `works`, `work_dois`, `citations`, `citation_index`,
+  `report_baselines` (see `app/db.py`).

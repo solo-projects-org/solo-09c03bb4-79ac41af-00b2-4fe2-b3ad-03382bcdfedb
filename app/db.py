@@ -43,6 +43,22 @@ CREATE TABLE IF NOT EXISTS citation_index (
 );
 
 CREATE INDEX IF NOT EXISTS idx_citation_index_cited ON citation_index(cited_work);
+
+-- Citation-report baselines, one row per report number.  Raw citations are
+-- NOT copied here: max_citation_id is the upper boundary of the raw-citation
+-- range that existed at registration (citations are append-only and
+-- immutable, so id <= max_citation_id selects exactly that range), and
+-- citing_works is the JSON array of distinct citing work ids under the
+-- grouping of baseline_version.  Version, citing works and citation range are
+-- written from one serialised transaction, so they describe the same version.
+CREATE TABLE IF NOT EXISTS report_baselines (
+    report_no          TEXT PRIMARY KEY,
+    representative_doi TEXT NOT NULL,
+    work_key           TEXT NOT NULL,
+    baseline_version   INTEGER NOT NULL,
+    max_citation_id    INTEGER NOT NULL,
+    citing_works       TEXT NOT NULL
+);
 """
 
 VERSION_KEY = "current_version"

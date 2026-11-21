@@ -3,6 +3,7 @@ import -> correct -> lookup round trip, plus a cross-process writer race."""
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import socket
@@ -166,3 +167,101 @@ def test_concurrent_corrections_over_tcp(server):
     assert outcomes.count(409) == 4, outcomes
     _, health = _get(server, "/health")
     assert health["version"] == version + 1
+
+
+@contextlib.contextmanager
+def _serve(db_path):
+    """Run the app as a separate process on ``db_path`` (like the container)."""
+    port = _free_port()
+    env = dict(os.environ, DB_PATH=str(db_path))
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "app.api:app", "--port", str(port)],
+        cwd=REPO,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    base = f"http://127.0.0.1:{port}"
+    try:
+        deadline = time.time() + 20
+        while True:
+            try:
+                if _get(base, "/health")[0] == 200:
+                    break
+            except Exception:
+                if time.time() > deadline:
+                    proc.kill()
+                    raise RuntimeError("server did not start")
+                time.sleep(0.1)
+        yield base
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def test_baseline_registration_and_review_across_restart(tmp_path):
+    """Register a baseline, restart the service on the same database file,
+    then review: the baseline survives the restart."""
+    db = tmp_path / "restart.db"
+    with _serve(db) as base:
+        status, body = _post(
+            base,
+            "/import",
+            {
+                "works": [
+                    {"work_id": 1, "dois": ["10.1/j", "10.1/p"]},
+                    {"work_id": 2, "dois": ["10.1/b"]},
+                    {"work_id": 3, "dois": ["10.1/c"]},
+                ],
+                "citations": [
+                    {"citing": "10.1/b", "cited": "10.1/j"},
+                    {"citing": "10.1/c", "cited": "10.1/p"},
+                ],
+            },
+        )
+        assert status == 201, body
+        status, baseline = _post(
+            base, "/report-baselines", {"report_no": "RPT-E2E", "doi": "10.1/j"}
+        )
+        assert status == 201, baseline
+        assert baseline["citing_works"] == [2, 3]
+        # Resubmission reuses the baseline.
+        status, reused = _post(
+            base, "/report-baselines", {"report_no": "RPT-E2E", "doi": "10.1/j"}
+        )
+        assert status == 200, reused
+        assert reused["created"] is False
+        # A different DOI for the same report number conflicts.
+        status, conflict = _post(
+            base, "/report-baselines", {"report_no": "RPT-E2E", "doi": "10.1/p"}
+        )
+        assert status == 409, conflict
+
+    # Second process lifetime on the same database file.
+    with _serve(db) as base:
+        status, review = _get(base, "/report-baselines/RPT-E2E/review")
+        assert status == 200
+        assert review["baseline_version"] == baseline["baseline_version"]
+        assert review["current_version"] == baseline["baseline_version"]
+        assert review["counts"] == {
+            "baseline": 2,
+            "registration_recount": 2,
+            "full_recount": 2,
+        }
+        # Backfill after the restart is attributed to backfill.
+        status, _ = _post(
+            base,
+            "/import",
+            {
+                "works": [{"work_id": 5, "dois": ["10.1/e"]}],
+                "citations": [{"citing": "10.1/e", "cited": "10.1/j"}],
+            },
+        )
+        assert status == 201
+        _, review = _get(base, "/report-baselines/RPT-E2E/review")
+        assert review["counts"]["full_recount"] == 3
+        assert review["backfill"] == {"added": [5], "removed": []}
+        assert review["regrouping"] == {"added": [], "removed": []}
